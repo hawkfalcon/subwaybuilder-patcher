@@ -354,25 +354,81 @@ const generateCommuteFlows = (blocks, employmentData) => {
     if (totalAttractiveness === 0) return;
     
     // Distribute origin population across destinations based on attractiveness
-    potentialFlows.forEach(flow => {
-      const flowSize = Math.round(originPop * (flow.attractiveness / totalAttractiveness));
-      
-      if (flowSize >= TUNING_PARAMS.minFlowSize) { // Only include significant flows
-        // Split large flows into multiple smaller ones (max 400 per flow, as per original code)
-        const splits = Math.ceil(flowSize / 400);
-        const sizePerSplit = Math.round(flowSize / splits);
+    const calculatedFlows = potentialFlows.map(flow => {
+      return {
+        ...flow,
+        size: Math.round(originPop * (flow.attractiveness / totalAttractiveness))
+      };
+    }).filter(f => f.size > 0);
+
+    // Separate into keep and merge
+    const keepFlows = [];
+    const mergeFlows = [];
+
+    calculatedFlows.forEach(flow => {
+      if (flow.size >= TUNING_PARAMS.minFlowSize) {
+        keepFlows.push(flow);
+      } else {
+        mergeFlows.push(flow);
+      }
+    });
+
+    // If no flows kept but we have merge flows, keep the largest one
+    if (keepFlows.length === 0 && mergeFlows.length > 0) {
+      mergeFlows.sort((a, b) => b.size - a.size);
+      keepFlows.push(mergeFlows.shift());
+    }
+
+    // Merge small flows into nearest keep flow
+    if (keepFlows.length > 0 && mergeFlows.length > 0) {
+      // Create map of keep flow destinations for quick lookup
+      const keepDestinations = keepFlows.map(k => {
+        const block = blocks.find(b => b.geoid === k.dest);
+        return {
+          geoid: k.dest,
+          point: turf.point(block.centroid),
+          flow: k
+        };
+      });
+
+      mergeFlows.forEach(mFlow => {
+        const mBlock = blocks.find(b => b.geoid === mFlow.dest);
+        const mPoint = turf.point(mBlock.centroid);
         
-        for (let i = 0; i < splits; i++) {
-          flows.push({
-            id: flowId.toString(),
-            residenceId: origin.geoid,
-            jobId: flow.dest,
-            size: sizePerSplit,
-            drivingDistance: Math.round(flow.distance),
-            drivingSeconds: Math.round(flow.distance * 0.12), // Same heuristic as original
-          });
-          flowId++;
+        // Find nearest keep destination
+        let minDist = Infinity;
+        let nearest = null;
+
+        keepDestinations.forEach(kDest => {
+          const dist = turf.distance(mPoint, kDest.point, { units: 'meters' });
+          if (dist < minDist) {
+            minDist = dist;
+            nearest = kDest;
+          }
+        });
+
+        if (nearest) {
+          nearest.flow.size += mFlow.size;
         }
+      });
+    }
+
+    // Add final flows
+    keepFlows.forEach(flow => {
+      // Split large flows into multiple smaller ones (max 400 per flow, as per original code)
+      const splits = Math.ceil(flow.size / 400);
+      const sizePerSplit = Math.round(flow.size / splits);
+      
+      for (let i = 0; i < splits; i++) {
+        flows.push({
+          id: flowId.toString(),
+          residenceId: origin.geoid,
+          jobId: flow.dest,
+          size: sizePerSplit,
+          drivingDistance: Math.round(flow.distance),
+          drivingSeconds: Math.round(flow.distance * 0.12), // Same heuristic as original
+        });
+        flowId++;
       }
     });
   });
