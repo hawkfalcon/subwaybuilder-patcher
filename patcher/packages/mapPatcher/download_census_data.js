@@ -426,23 +426,56 @@ const estimateEmploymentData = async (blocks, place) => {
 /**
  * Step 4: Generate commute flows between blocks
  * Uses gravity model: flow proportional to (pop_origin * jobs_dest) / distance^2
+ * 
+ * Low-population blocks are merged into their nearest neighbor to preserve total population
+ * while reducing flow complexity.
  */
 const generateCommuteFlows = (blocks, employmentData) => {
   console.log('Generating commute flows...');
+  
+  // Step 1: Merge low-population blocks into nearest neighbors
+  const adjustedPopulation = {};
+  const lowPopBlocks = [];
+  const normalBlocks = [];
+  
+  // Initialize adjusted population and categorize blocks
+  blocks.forEach(block => {
+    adjustedPopulation[block.geoid] = block.population;
+    if (block.population > 0 && block.population < TUNING_PARAMS.minPopPerBlock) {
+      lowPopBlocks.push(block);
+    } else if (block.population >= TUNING_PARAMS.minPopPerBlock) {
+      normalBlocks.push(block);
+    }
+  });
+  
+  // Merge each low-pop block into its nearest normal block
+  if (normalBlocks.length > 0) {
+    const normalBlockPoints = turf.featureCollection(
+      normalBlocks.map(b => turf.point(b.centroid, { geoid: b.geoid }))
+    );
+    
+    lowPopBlocks.forEach(lowBlock => {
+      const nearest = turf.nearestPoint(turf.point(lowBlock.centroid), normalBlockPoints);
+      const nearestGeoid = nearest.properties.geoid;
+      
+      // Transfer population to nearest block
+      adjustedPopulation[nearestGeoid] += lowBlock.population;
+      adjustedPopulation[lowBlock.geoid] = 0; // Zero out the low-pop block
+    });
+    
+    console.log(`  Merged ${lowPopBlocks.length} low-population blocks into ${normalBlocks.length} neighbors`);
+  }
   
   const flows = [];
   let flowId = 0;
   
   // For each residential block (origin)
   blocks.forEach(origin => {
-    const originPop = origin.population;
-    if (originPop < TUNING_PARAMS.minPopPerBlock) return; // Skip very low population areas
+    const originPop = adjustedPopulation[origin.geoid];
+    if (originPop < TUNING_PARAMS.minPopPerBlock) return; // Skip blocks with no adjusted population
     
     // Calculate flows to each employment block (destination)
     const potentialFlows = [];
-    
-    // Optimization: Only consider blocks within a certain distance or limit to top N destinations
-    // For now, we'll process all but might need optimization for large areas
     
     blocks.forEach(dest => {
       if (origin.geoid === dest.geoid) {
