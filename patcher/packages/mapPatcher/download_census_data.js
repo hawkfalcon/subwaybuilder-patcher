@@ -35,9 +35,9 @@ const TUNING_PARAMS = {
   localJobBonus: 0.001,              // Multiplier for same-block jobs (0.001 = nearly eliminated)
                                      // Lower = discourage working where you live
   
-  minFlowSize: 5,                    // Minimum commuters per flow to include
-  minJobsPerBlock: 5,                // Minimum jobs to consider a block as employment center
-  minPopPerBlock: 10,                // Minimum population to generate flows from a block
+  minFlowSize: 10,                   // Minimum commuters per flow to include
+  minJobsPerBlock: 20,               // Minimum jobs to consider a block as employment center
+  minPopPerBlock: 20,                // Minimum population to generate flows from a block
 };
 
 // Helper: Sleep function for rate limiting
@@ -383,31 +383,103 @@ const generateCommuteFlows = (blocks, employmentData) => {
 
 /**
  * Step 5: Format data as demand_data.json
+ * Merges small clusters into nearest neighbors to reduce noise
  */
 const formatDemandData = (blocks, employmentData, flows) => {
   console.log('Formatting demand data...');
   
-  // Create points array
-  const points = blocks.map(block => {
+  // Step 1: Identify and merge small clusters
+  const minResidents = TUNING_PARAMS.minPopPerBlock;
+  const minJobs = TUNING_PARAMS.minJobsPerBlock;
+  
+  const smallBlocks = [];
+  const largeBlocks = [];
+  
+  blocks.forEach(block => {
     const jobs = employmentData[block.geoid] || 0;
+    const pop = block.population;
     
-    // Find all flows that reference this block
-    const popIds = flows
-      .filter(f => f.residenceId === block.geoid || f.jobId === block.geoid)
-      .map(f => f.id);
+    // A block is "small" if it has low population AND low jobs
+    if (pop < minResidents && jobs < minJobs) {
+      smallBlocks.push(block);
+    } else {
+      largeBlocks.push(block);
+    }
+  });
+  
+  // Merge small blocks into nearest large blocks
+  const mergedEmployment = { ...employmentData };
+  const mergedPopulation = {};
+  blocks.forEach(b => mergedPopulation[b.geoid] = b.population);
+  
+  const flowRedirects = {}; // Map old geoid -> new geoid
+  
+  if (largeBlocks.length > 0 && smallBlocks.length > 0) {
+    const largeBlockPoints = turf.featureCollection(
+      largeBlocks.map(b => turf.point(b.centroid, { geoid: b.geoid }))
+    );
+    
+    smallBlocks.forEach(smallBlock => {
+      const nearest = turf.nearestPoint(turf.point(smallBlock.centroid), largeBlockPoints);
+      const nearestGeoid = nearest.properties.geoid;
+      
+      // Transfer population and jobs
+      mergedPopulation[nearestGeoid] += smallBlock.population;
+      mergedEmployment[nearestGeoid] += (employmentData[smallBlock.geoid] || 0);
+      
+      // Mark for removal
+      mergedPopulation[smallBlock.geoid] = 0;
+      mergedEmployment[smallBlock.geoid] = 0;
+      
+      // Track redirect for flow updates
+      flowRedirects[smallBlock.geoid] = nearestGeoid;
+    });
+    
+    console.log(`  Merged ${smallBlocks.length} small clusters into ${largeBlocks.length} larger clusters`);
+  }
+  
+  // Step 2: Update flows to redirect to merged blocks
+  const updatedFlows = flows.map(flow => {
+    const newResidenceId = flowRedirects[flow.residenceId] || flow.residenceId;
+    const newJobId = flowRedirects[flow.jobId] || flow.jobId;
     
     return {
-      id: block.geoid,
-      location: block.centroid,
-      jobs: jobs,
-      residents: block.population,
-      popIds: popIds,
+      ...flow,
+      residenceId: newResidenceId,
+      jobId: newJobId,
     };
   });
   
+  // Step 3: Create points array (excluding merged blocks)
+  const points = blocks
+    .filter(block => {
+      const pop = mergedPopulation[block.geoid];
+      const jobs = mergedEmployment[block.geoid];
+      return pop > 0 || jobs > 0; // Keep blocks with any population or jobs
+    })
+    .map(block => {
+      const jobs = mergedEmployment[block.geoid] || 0;
+      const pop = mergedPopulation[block.geoid];
+      
+      // Find all flows that reference this block
+      const popIds = updatedFlows
+        .filter(f => f.residenceId === block.geoid || f.jobId === block.geoid)
+        .map(f => f.id);
+      
+      return {
+        id: block.geoid,
+        location: block.centroid,
+        jobs: jobs,
+        residents: pop,
+        popIds: popIds,
+      };
+    });
+  
+  console.log(`  Final output: ${points.length} points (from ${blocks.length} clusters)`);
+  
   return {
     points: points,
-    pops: flows,
+    pops: updatedFlows,
   };
 };
 
