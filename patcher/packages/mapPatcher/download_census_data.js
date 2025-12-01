@@ -129,9 +129,8 @@ const getCensusBlocksInBbox = async (place) => {
         block: props.GEOID.substring(11, 15),
       };
     })
-    .filter(b => b !== null)
-    // Filter out blocks with 0 population to avoid "dots in ocean" and reduce processing
-    .filter(b => b.population > 0);
+    .filter(b => b !== null);
+    // .filter(b => b.population > 0); // Removed to include commercial-only blocks
     
   console.log(`  Filtered to ${blocks.length} populated blocks`);
   return blocks;
@@ -141,12 +140,84 @@ const getCensusBlocksInBbox = async (place) => {
 
 /**
  * Step 3: Get employment data from LODES (Longitudinal Employer-Household Dynamics)
- * Note: LODES data is at the Census Block level, we'll aggregate to Block Groups
- * 
- * For simplicity and rate limiting, we'll use a heuristic approach:
- * - Estimate jobs based on population density and land use
- * - Use distance-based commute flow modeling
+ * Downloads and parses the Workplace Area Characteristics (WAC) file for the state.
  */
+import zlib from 'zlib';
+import readline from 'readline';
+import { pipeline } from 'stream';
+import { promisify } from 'util';
+
+const streamPipeline = promisify(pipeline);
+
+const downloadLodesData = async (stateCode) => {
+  const state = stateCode.toLowerCase();
+  const filename = `${state}_wac_S000_JT00_2021.csv.gz`;
+  const url = `https://lehd.ces.census.gov/data/lodes/LODES8/${state}/wac/${filename}`;
+  const outputDir = `${import.meta.dirname}/raw_data/LODES`;
+  const outputPath = `${outputDir}/${filename}`;
+
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
+  }
+
+  if (fs.existsSync(outputPath)) {
+    console.log(`  Using cached LODES data: ${filename}`);
+    return outputPath;
+  }
+
+  console.log(`  Downloading LODES data from ${url}...`);
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to download LODES data: ${response.statusText}`);
+  }
+
+  const fileStream = fs.createWriteStream(outputPath);
+  await streamPipeline(response.body, fileStream);
+  console.log(`  Downloaded LODES data to ${outputPath}`);
+  return outputPath;
+};
+
+const parseLodesData = async (filePath, targetBlockGeoids) => {
+  console.log('  Parsing LODES data...');
+  const jobCounts = {};
+  const targetBlocks = new Set(targetBlockGeoids);
+  
+  const fileStream = fs.createReadStream(filePath);
+  const unzipStream = zlib.createGunzip();
+  const rl = readline.createInterface({
+    input: fileStream.pipe(unzipStream),
+    crlfDelay: Infinity
+  });
+
+  let header = null;
+  let geoidIdx = -1;
+  let jobsIdx = -1;
+  let count = 0;
+
+  for await (const line of rl) {
+    if (!header) {
+      header = line.split(',');
+      geoidIdx = header.indexOf('w_geocode');
+      jobsIdx = header.indexOf('C000'); // Total jobs
+      continue;
+    }
+
+    const cols = line.split(',');
+    const geoid = cols[geoidIdx];
+    
+    // Only store data for blocks we care about (in our target area)
+    if (targetBlocks.has(geoid)) {
+      const jobs = parseInt(cols[jobsIdx], 10) || 0;
+      if (jobs > 0) {
+        jobCounts[geoid] = jobs;
+        count += jobs;
+      }
+    }
+  }
+
+  console.log(`  Found ${count.toLocaleString()} jobs in the target area from LODES data.`);
+  return jobCounts;
+};
 // Job density constants (sq ft per job) - Copied from process_data.js
 const squareFeetPerJob = {
   commercial: 150,
@@ -250,55 +321,106 @@ const loadOSMBuildings = (place) => {
  * Uses OSM buildings to distribute jobs spatially if available
  * Fallback to population-based heuristic
  */
-const estimateEmploymentData = (blocks, place) => {
+/**
+ * Step 3: Get employment data
+ * Uses LODES data if available, falls back to heuristic
+ */
+const estimateEmploymentData = async (blocks, place) => {
   console.log('Estimating employment data...');
   
-  const employmentData = {};
-  const osmBuildings = loadOSMBuildings(place);
-  
-  if (osmBuildings.length > 0) {
-    // Strategy: Distribute total target jobs based on building capacity
-    const totalPopulation = blocks.reduce((sum, b) => sum + b.population, 0);
-    const targetTotalJobs = Math.round(totalPopulation * TUNING_PARAMS.jobRatio);
-    const totalCapacity = osmBuildings.reduce((sum, b) => sum + b.capacity, 0);
+  // Try to get real LODES data
+  try {
+    // Assuming place.code is like "SBA" but we need state code. 
+    // We can get state code from the first block's GEOID (first 2 digits)
+    // State FIPS codes: 06 = CA, etc.
+    // We need to map FIPS to postal code (e.g. 06 -> ca)
+    // For now, let's just assume CA for SBA or implement a helper if needed.
+    // Actually, let's use a lookup or just hardcode for the known places if simple.
+    // Better: a simple FIPS map.
     
-    console.log(`  Distributing ${targetTotalJobs.toLocaleString()} jobs across ${osmBuildings.length} buildings (Ratio: ${TUNING_PARAMS.jobRatio})...`);
+    const stateFips = blocks[0].state;
+    const fipsToPostal = {
+      '06': 'ca',
+      '36': 'ny',
+      '48': 'tx',
+      '12': 'fl',
+      '17': 'il',
+      '42': 'pa',
+      '39': 'oh',
+      '13': 'ga',
+      '37': 'nc',
+      '26': 'mi'
+    };
     
-    // Create a spatial index for blocks (simple array for now, nearestPoint is fast enough)
-    const blockPoints = turf.featureCollection(
-      blocks.map(b => turf.point(b.centroid, { geoid: b.geoid }))
-    );
+    const stateCode = fipsToPostal[stateFips];
+    if (!stateCode) {
+      console.warn(`  Unknown state FIPS ${stateFips}, falling back to heuristic.`);
+      throw new Error('Unknown state FIPS');
+    }
+
+    const lodesPath = await downloadLodesData(stateCode);
+    const blockGeoids = blocks.map(b => b.geoid);
+    const realJobCounts = await parseLodesData(lodesPath, blockGeoids);
     
-    // Initialize job counts
-    blocks.forEach(b => employmentData[b.geoid] = 0);
-    
-    // Assign jobs from buildings to nearest block
-    osmBuildings.forEach(b => {
-      const jobs = (b.capacity / totalCapacity) * targetTotalJobs;
-      const nearest = turf.nearestPoint(turf.point(b.centroid), blockPoints);
-      const blockGeoid = nearest.properties.geoid;
-      
-      employmentData[blockGeoid] = (employmentData[blockGeoid] || 0) + jobs;
+    // Fill in the data
+    const employmentData = {};
+    blocks.forEach(b => {
+      employmentData[b.geoid] = realJobCounts[b.geoid] || 0;
     });
     
-    // Round job counts
-    Object.keys(employmentData).forEach(k => {
-      employmentData[k] = Math.round(employmentData[k]);
-    });
+    const totalJobs = Object.values(employmentData).reduce((a, b) => a + b, 0);
+    console.log(`  Total jobs from LODES: ${totalJobs.toLocaleString()}`);
     
-  } else {
-    // Fallback: Uniform distribution based on population
-    blocks.forEach(block => {
-      const estimatedJobs = Math.round(block.population * TUNING_PARAMS.jobRatio);
-      employmentData[block.geoid] = estimatedJobs;
-    });
+    if (totalJobs === 0) {
+        console.warn('  LODES data returned 0 jobs, falling back to heuristic.');
+        throw new Error('No jobs found in LODES data');
+    }
+
+    return employmentData;
+
+  } catch (e) {
+    console.warn(`  Could not load LODES data: ${e.message}`);
+    console.log('  Using heuristic fallback...');
+    
+    const employmentData = {};
+    const osmBuildings = loadOSMBuildings(place);
+    
+    if (osmBuildings.length > 0) {
+        // ... (existing heuristic code) ...
+        const totalPopulation = blocks.reduce((sum, b) => sum + b.population, 0);
+        const targetTotalJobs = Math.round(totalPopulation * TUNING_PARAMS.jobRatio);
+        const totalCapacity = osmBuildings.reduce((sum, b) => sum + b.capacity, 0);
+        
+        // Create a spatial index for blocks
+        const blockPoints = turf.featureCollection(
+        blocks.map(b => turf.point(b.centroid, { geoid: b.geoid }))
+        );
+        
+        // Initialize job counts
+        blocks.forEach(b => employmentData[b.geoid] = 0);
+        
+        // Assign jobs from buildings to nearest block
+        osmBuildings.forEach(b => {
+        const jobs = (b.capacity / totalCapacity) * targetTotalJobs;
+        const nearest = turf.nearestPoint(turf.point(b.centroid), blockPoints);
+        const blockGeoid = nearest.properties.geoid;
+        
+        employmentData[blockGeoid] = (employmentData[blockGeoid] || 0) + jobs;
+        });
+        
+        // Round job counts
+        Object.keys(employmentData).forEach(k => {
+        employmentData[k] = Math.round(employmentData[k]);
+        });
+    } else {
+        // Fallback: Uniform distribution based on population
+        blocks.forEach(block => {
+        const estimatedJobs = Math.round(block.population * TUNING_PARAMS.jobRatio);
+        employmentData[block.geoid] = estimatedJobs;
+        });
+    }
+    return employmentData;
   }
-  
-  // Count blocks with jobs
-  const blocksWithJobs = Object.values(employmentData).filter(j => j > 0).length;
-  console.log(`  Assigned jobs to ${blocksWithJobs} blocks (out of ${blocks.length})`);
-  
-  return employmentData;
 };
 
 /**
@@ -489,16 +611,24 @@ const fetchCensusData = async (place) => {
     // Step 1: Get census blocks (with population and location)
     const blocks = await getCensusBlocksInBbox(place);
     
-    if (blocks.length === 0) {
-      throw new Error(`No populated census blocks found for ${place.name}`);
+    // Step 2: Estimate employment
+    const employmentData = await estimateEmploymentData(blocks, place);
+    
+    // Step 2.5: Filter out blocks with no population AND no jobs
+    const activeBlocks = blocks.filter(b => {
+      const jobs = employmentData[b.geoid] || 0;
+      return b.population > 0 || jobs > 0;
+    });
+    
+    console.log(`  Filtered to ${activeBlocks.length} active blocks (from ${blocks.length} total)`);
+    
+    if (activeBlocks.length === 0) {
+      throw new Error(`No populated or employed census blocks found for ${place.name}`);
     }
     
-    // Step 2: Estimate employment
-    const employmentData = estimateEmploymentData(blocks, place);
-    
-    // Step 2.5: Aggregate blocks
+    // Step 2.6: Aggregate blocks
     // Merge nearby blocks to reduce graph complexity
-    const clusters = aggregateBlocks(blocks, employmentData, TUNING_PARAMS.clusterThresholdMeters);
+    const clusters = aggregateBlocks(activeBlocks, employmentData, TUNING_PARAMS.clusterThresholdMeters);
     
     // Create a new employment map for the clusters
     const clusterEmployment = {};
