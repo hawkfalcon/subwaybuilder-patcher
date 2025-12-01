@@ -20,6 +20,32 @@ const CENSUS_YEAR = config['census-year'] || '2021';
 const CENSUS_API_KEY = config['census-api-key'] || null;
 const DELAY_BETWEEN_REQUESTS = 100; // ms to avoid rate limiting
 
+// ============================================================================
+// TUNING PARAMETERS
+// Adjust these to control job distribution, clustering, and commute patterns
+// ============================================================================
+const TUNING_PARAMS = {
+  // Employment estimation
+  jobRatio: 0.95,                    // Jobs per resident (0.95 = ~200k jobs for SBA)
+  
+  // Block aggregation (clustering)
+  clusterThresholdMeters: 300,       // Distance threshold for merging blocks (300m = 1:3 ratio)
+  
+  // Gravity model for commute flows
+  gravityExponent: 0.5,              // Distance decay exponent (lower = favor distant jobs)
+                                     // 0.5 = very aggressive, 1.0 = moderate, 1.5 = conservative
+  
+  gravityMinDistance: 2500,          // Minimum distance for gravity calc (meters)
+                                     // Higher = penalize short trips more heavily
+  
+  localJobBonus: 0.001,              // Multiplier for same-block jobs (0.001 = nearly eliminated)
+                                     // Lower = discourage working where you live
+  
+  minFlowSize: 5,                    // Minimum commuters per flow to include
+  minJobsPerBlock: 5,                // Minimum jobs to consider a block as employment center
+  minPopPerBlock: 10,                // Minimum population to generate flows from a block
+};
+
 // Helper: Sleep function for rate limiting
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -224,7 +250,7 @@ const loadOSMBuildings = (place) => {
  * Uses OSM buildings to distribute jobs spatially if available
  * Fallback to population-based heuristic
  */
-const estimateEmploymentData = (blocks, place, jobRatio = 0.4) => {
+const estimateEmploymentData = (blocks, place) => {
   console.log('Estimating employment data...');
   
   const employmentData = {};
@@ -233,10 +259,10 @@ const estimateEmploymentData = (blocks, place, jobRatio = 0.4) => {
   if (osmBuildings.length > 0) {
     // Strategy: Distribute total target jobs based on building capacity
     const totalPopulation = blocks.reduce((sum, b) => sum + b.population, 0);
-    const targetTotalJobs = Math.round(totalPopulation * jobRatio);
+    const targetTotalJobs = Math.round(totalPopulation * TUNING_PARAMS.jobRatio);
     const totalCapacity = osmBuildings.reduce((sum, b) => sum + b.capacity, 0);
     
-    console.log(`  Distributing ${targetTotalJobs.toLocaleString()} jobs across ${osmBuildings.length} buildings (Ratio: ${jobRatio})...`);
+    console.log(`  Distributing ${targetTotalJobs.toLocaleString()} jobs across ${osmBuildings.length} buildings (Ratio: ${TUNING_PARAMS.jobRatio})...`);
     
     // Create a spatial index for blocks (simple array for now, nearestPoint is fast enough)
     const blockPoints = turf.featureCollection(
@@ -263,7 +289,7 @@ const estimateEmploymentData = (blocks, place, jobRatio = 0.4) => {
   } else {
     // Fallback: Uniform distribution based on population
     blocks.forEach(block => {
-      const estimatedJobs = Math.round(block.population * jobRatio);
+      const estimatedJobs = Math.round(block.population * TUNING_PARAMS.jobRatio);
       employmentData[block.geoid] = estimatedJobs;
     });
   }
@@ -288,7 +314,7 @@ const generateCommuteFlows = (blocks, employmentData) => {
   // For each residential block (origin)
   blocks.forEach(origin => {
     const originPop = origin.population;
-    if (originPop < 10) return; // Skip very low population areas (reduced threshold for blocks)
+    if (originPop < TUNING_PARAMS.minPopPerBlock) return; // Skip very low population areas
     
     // Calculate flows to each employment block (destination)
     const potentialFlows = [];
@@ -298,21 +324,21 @@ const generateCommuteFlows = (blocks, employmentData) => {
     
     blocks.forEach(dest => {
       if (origin.geoid === dest.geoid) {
-        // Same block - strongly discourage to force travel
+        // Same block - eliminate local work entirely
         const sameAreaJobs = employmentData[dest.geoid] || 0;
         if (sameAreaJobs > 0) {
           potentialFlows.push({
             dest: dest.geoid,
             jobs: sameAreaJobs,
             distance: 0,
-            attractiveness: sameAreaJobs * 0.01, // Minimal bonus (was 0.1, now 0.01)
+            attractiveness: sameAreaJobs * TUNING_PARAMS.localJobBonus,
           });
         }
         return;
       }
       
       const destJobs = employmentData[dest.geoid] || 0;
-      if (destJobs < 5) return; // Skip very low employment areas (reduced threshold)
+      if (destJobs < TUNING_PARAMS.minJobsPerBlock) return; // Skip very low employment areas
       
       // Calculate distance between centroids
       const distance = turf.distance(
@@ -322,10 +348,11 @@ const generateCommuteFlows = (blocks, employmentData) => {
       );
       
       // Gravity model: attractiveness = jobs / (distance^alpha)
-      // Aggressively tuned for realistic modeshare:
-      // - Exponent 0.7 (was 1.0): Strongly favors distant jobs (more driving/transit)
-      // - Min distance 1500m (was 500m): Heavily penalizes very short trips
-      const attractiveness = destJobs / Math.pow(Math.max(distance, 1500), 0.7);
+      // See TUNING_PARAMS at top of file for parameter explanations
+      const attractiveness = destJobs / Math.pow(
+        Math.max(distance, TUNING_PARAMS.gravityMinDistance), 
+        TUNING_PARAMS.gravityExponent
+      );
       
       potentialFlows.push({
         dest: dest.geoid,
@@ -344,7 +371,7 @@ const generateCommuteFlows = (blocks, employmentData) => {
     potentialFlows.forEach(flow => {
       const flowSize = Math.round(originPop * (flow.attractiveness / totalAttractiveness));
       
-      if (flowSize >= 5) { // Only include significant flows (reduced threshold for blocks)
+      if (flowSize >= TUNING_PARAMS.minFlowSize) { // Only include significant flows
         // Split large flows into multiple smaller ones (max 400 per flow, as per original code)
         const splits = Math.ceil(flowSize / 400);
         const sizePerSplit = Math.round(flowSize / splits);
@@ -467,13 +494,11 @@ const fetchCensusData = async (place) => {
     }
     
     // Step 2: Estimate employment
-    // Updated heuristic: 0.95 jobs per resident to match user's "Google says 200k" figure
-    // (200k jobs / 209k pop = ~0.95)
-    const employmentData = estimateEmploymentData(blocks, place, 0.95);
+    const employmentData = estimateEmploymentData(blocks, place);
     
     // Step 2.5: Aggregate blocks
-    // Merge nearby blocks to reduce graph complexity (User requested ~1 per 3)
-    const clusters = aggregateBlocks(blocks, employmentData, 300);
+    // Merge nearby blocks to reduce graph complexity
+    const clusters = aggregateBlocks(blocks, employmentData, TUNING_PARAMS.clusterThresholdMeters);
     
     // Create a new employment map for the clusters
     const clusterEmployment = {};

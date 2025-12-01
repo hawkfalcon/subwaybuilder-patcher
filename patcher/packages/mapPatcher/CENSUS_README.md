@@ -42,7 +42,25 @@ The script will:
 
 ### Configuration
 
-No special configuration needed in `config.js`.
+The script includes a `TUNING_PARAMS` object at the top of `download_census_data.js` for easy customization:
+
+```javascript
+const TUNING_PARAMS = {
+  jobRatio: 0.95,                    // Jobs per resident
+  clusterThresholdMeters: 300,       // Block aggregation distance (1:3 ratio)
+  gravityExponent: 0.5,              // Distance decay (0.5 = aggressive, 1.5 = conservative)
+  gravityMinDistance: 2500,          // Min distance for gravity calc (meters)
+  localJobBonus: 0.001,              // Same-block job multiplier
+  minFlowSize: 5,                    // Minimum commuters per flow
+  minJobsPerBlock: 5,                // Minimum jobs per employment center
+  minPopPerBlock: 10,                // Minimum population to generate flows
+};
+```
+
+**Key Parameters:**
+- **`gravityExponent`**: Lower values (0.5) favor longer commutes, higher values (1.5) favor shorter trips
+- **`gravityMinDistance`**: Higher values reduce walking modeshare
+- **`clusterThresholdMeters`**: Lower values create more clusters (higher granularity)
 
 ## Output Format
 
@@ -99,14 +117,14 @@ The generated `demand_data.json` matches the existing format:
 ✅ **Accurate Population**: Real Decennial 2020 counts  
 ✅ **Precise Locations**: Uses official internal points (centroids)  
 ✅ **Realistic Commutes**: Jobs clustered in commercial areas (using OSM), forcing travel  
-✅ **Realistic Modeshare**: Gravity model tuned for US cities (11% walking, avg 7.9km commute)  
+✅ **Realistic Modeshare**: Gravity model tuned for US cities (6.3% walking, avg 8.3km commute)  
 ✅ **Clean Data**: Filters out unpopulated areas (ocean, wilderness)  
 
 ### Limitations
 
 ⚠️ **Employment Estimation**: Uses 0.95 jobs/resident target (tuned for SBA) + OSM capacity  
 ⚠️ **Commute Flows**: Gravity model estimation (not actual commute patterns)  
-⚠️ **Gravity Model**: Aggressively tuned (exponent 0.7, min distance 1500m) - may need adjustment for other cities  
+⚠️ **Gravity Model**: Extremely aggressive tuning (exponent 0.5, min distance 2500m) - may need adjustment for other cities  
 ⚠️ **US Only**: Census API only covers United States    
 
 ## Technical Details
