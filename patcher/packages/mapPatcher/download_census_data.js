@@ -5,19 +5,16 @@ import * as turf from '@turf/turf';
 /**
  * Census Data Downloader for Subway Builder Patcher
  * 
- * This script fetches US Census data (Block Groups) for configured places
+ * This script fetches US Census data for configured places
  * and generates demand_data.json with actual population and employment data.
  * 
  * Data Sources:
- * - TIGERweb API: Block Group boundaries
- * - Census ACS 5-Year API: Population data
- * - LODES API: Employment and commute flow data
+ * - TIGERweb API: Census Block boundaries and population (2020)
+ * - LODES: Employment data (2021)
  * 
- * Rate Limiting: Designed to work within 500 requests/day limit (no API key)
+ * No API key required for either data source.
  */
 
-const CENSUS_YEAR = config['census-year'] || '2021';
-const CENSUS_API_KEY = config['census-api-key'] || null;
 const DELAY_BETWEEN_REQUESTS = 100; // ms to avoid rate limiting
 
 // ============================================================================
@@ -25,9 +22,6 @@ const DELAY_BETWEEN_REQUESTS = 100; // ms to avoid rate limiting
 // Adjust these to control job distribution, clustering, and commute patterns
 // ============================================================================
 const TUNING_PARAMS = {
-  // Employment estimation
-  jobRatio: 0.95,                    // Jobs per resident (0.95 = ~200k jobs for SBA)
-  
   // Block aggregation (clustering)
   clusterThresholdMeters: 300,       // Distance threshold for merging blocks (300m = 1:3 ratio)
   
@@ -218,209 +212,46 @@ const parseLodesData = async (filePath, targetBlockGeoids) => {
   console.log(`  Found ${count.toLocaleString()} jobs in the target area from LODES data.`);
   return jobCounts;
 };
-// Job density constants (sq ft per job) - Copied from process_data.js
-const squareFeetPerJob = {
-  commercial: 150,
-  industrial: 500,
-  kiosk: 50,
-  office: 150,
-  retail: 300,
-  supermarket: 300,
-  warehouse: 500,
-  religious: 100,
-  cathedral: 100,
-  chapel: 100,
-  church: 100,
-  kingdom_hall: 100,
-  monastery: 100,
-  mosque: 100,
-  presbytery: 100,
-  shrine: 100,
-  synagogue: 100,
-  temple: 100,
-  bakehouse: 300,
-  college: 250,
-  fire_station: 500,
-  government: 150,
-  gatehouse: 150,
-  hospital: 150,
-  kindergarten: 100,
-  museum: 300,
-  public: 300,
-  school: 100,
-  train_station: 1000,
-  transportation: 1000,
-  university: 250,
-  grandstand: 150,
-  pavilion: 150,
-  riding_hall: 150,
-  sports_hall: 150,
-  sports_centre: 150,
-  stadium: 150,
-};
 
 /**
- * Helper: Load OSM buildings from raw_data if available
+ * Step 3: Get employment data from LODES
  */
-const loadOSMBuildings = (place) => {
-  const buildingsPath = `${import.meta.dirname}/raw_data/${place.code}/buildings.json`;
+const getEmploymentData = async (blocks) => {
+  console.log('Fetching employment data from LODES...');
   
-  if (!fs.existsSync(buildingsPath)) {
-    console.log('  No OSM buildings.json found, using population-based job heuristic.');
-    return [];
-  }
+  const stateFips = blocks[0].state;
+  const fipsToPostal = {
+    '06': 'ca',
+    '36': 'ny',
+    '48': 'tx',
+    '12': 'fl',
+    '17': 'il',
+    '42': 'pa',
+    '39': 'oh',
+    '13': 'ga',
+    '37': 'nc',
+    '26': 'mi'
+  };
   
-  console.log('  Loading OSM buildings for job distribution...');
-  try {
-    const rawBuildings = JSON.parse(fs.readFileSync(buildingsPath, 'utf8'));
-    
-    const jobBuildings = rawBuildings
-      .filter(b => b.tags && b.tags.building && squareFeetPerJob[b.tags.building])
-      .map(b => {
-        // Calculate area
-        let area = 0;
-        let centroid = null;
-        
-        if (b.type === 'way' && b.geometry && b.geometry.length >= 3) {
-          const coords = b.geometry.map(p => [p.lon, p.lat]);
-          // Close the ring if needed
-          if (coords[0][0] !== coords[coords.length-1][0] || coords[0][1] !== coords[coords.length-1][1]) {
-            coords.push(coords[0]);
-          }
-          const polygon = turf.polygon([coords]);
-          area = turf.area(polygon) * 10.7639; // sq meters to sq ft
-          centroid = turf.centroid(polygon).geometry.coordinates;
-        } else if (b.bounds) {
-          // Fallback for relations or simple bounds
-          const width = turf.distance([b.bounds.minlon, b.bounds.minlat], [b.bounds.maxlon, b.bounds.minlat], {units: 'feet'});
-          const height = turf.distance([b.bounds.minlon, b.bounds.minlat], [b.bounds.minlon, b.bounds.maxlat], {units: 'feet'});
-          area = width * height;
-          centroid = [(b.bounds.minlon + b.bounds.maxlon)/2, (b.bounds.minlat + b.bounds.maxlat)/2];
-        }
-        
-        if (!centroid) return null;
-        
-        const levels = Math.max(parseInt(b.tags['building:levels']) || 1, 1);
-        const sqFtPerJob = squareFeetPerJob[b.tags.building] || 200;
-        const capacity = Math.max((area * levels) / sqFtPerJob, 1);
-        
-        return { centroid, capacity };
-      })
-      .filter(b => b !== null);
-      
-    console.log(`  Found ${jobBuildings.length} commercial/industrial buildings.`);
-    return jobBuildings;
-  } catch (e) {
-    console.warn(`  Error loading buildings.json: ${e.message}`);
-    return [];
+  const stateCode = fipsToPostal[stateFips];
+  if (!stateCode) {
+    throw new Error(`Unsupported state FIPS code: ${stateFips}. Please add to fipsToPostal mapping.`);
   }
-};
 
-/**
- * Step 3: Get employment data
- * Uses OSM buildings to distribute jobs spatially if available
- * Fallback to population-based heuristic
- */
-/**
- * Step 3: Get employment data
- * Uses LODES data if available, falls back to heuristic
- */
-const estimateEmploymentData = async (blocks, place) => {
-  console.log('Estimating employment data...');
+  const lodesPath = await downloadLodesData(stateCode);
+  const blockGeoids = blocks.map(b => b.geoid);
+  const realJobCounts = await parseLodesData(lodesPath, blockGeoids);
   
-  // Try to get real LODES data
-  try {
-    // Assuming place.code is like "SBA" but we need state code. 
-    // We can get state code from the first block's GEOID (first 2 digits)
-    // State FIPS codes: 06 = CA, etc.
-    // We need to map FIPS to postal code (e.g. 06 -> ca)
-    // For now, let's just assume CA for SBA or implement a helper if needed.
-    // Actually, let's use a lookup or just hardcode for the known places if simple.
-    // Better: a simple FIPS map.
-    
-    const stateFips = blocks[0].state;
-    const fipsToPostal = {
-      '06': 'ca',
-      '36': 'ny',
-      '48': 'tx',
-      '12': 'fl',
-      '17': 'il',
-      '42': 'pa',
-      '39': 'oh',
-      '13': 'ga',
-      '37': 'nc',
-      '26': 'mi'
-    };
-    
-    const stateCode = fipsToPostal[stateFips];
-    if (!stateCode) {
-      console.warn(`  Unknown state FIPS ${stateFips}, falling back to heuristic.`);
-      throw new Error('Unknown state FIPS');
-    }
-
-    const lodesPath = await downloadLodesData(stateCode);
-    const blockGeoids = blocks.map(b => b.geoid);
-    const realJobCounts = await parseLodesData(lodesPath, blockGeoids);
-    
-    // Fill in the data
-    const employmentData = {};
-    blocks.forEach(b => {
-      employmentData[b.geoid] = realJobCounts[b.geoid] || 0;
-    });
-    
-    const totalJobs = Object.values(employmentData).reduce((a, b) => a + b, 0);
-    console.log(`  Total jobs from LODES: ${totalJobs.toLocaleString()}`);
-    
-    if (totalJobs === 0) {
-        console.warn('  LODES data returned 0 jobs, falling back to heuristic.');
-        throw new Error('No jobs found in LODES data');
-    }
-
-    return employmentData;
-
-  } catch (e) {
-    console.warn(`  Could not load LODES data: ${e.message}`);
-    console.log('  Using heuristic fallback...');
-    
-    const employmentData = {};
-    const osmBuildings = loadOSMBuildings(place);
-    
-    if (osmBuildings.length > 0) {
-        // ... (existing heuristic code) ...
-        const totalPopulation = blocks.reduce((sum, b) => sum + b.population, 0);
-        const targetTotalJobs = Math.round(totalPopulation * TUNING_PARAMS.jobRatio);
-        const totalCapacity = osmBuildings.reduce((sum, b) => sum + b.capacity, 0);
-        
-        // Create a spatial index for blocks
-        const blockPoints = turf.featureCollection(
-        blocks.map(b => turf.point(b.centroid, { geoid: b.geoid }))
-        );
-        
-        // Initialize job counts
-        blocks.forEach(b => employmentData[b.geoid] = 0);
-        
-        // Assign jobs from buildings to nearest block
-        osmBuildings.forEach(b => {
-        const jobs = (b.capacity / totalCapacity) * targetTotalJobs;
-        const nearest = turf.nearestPoint(turf.point(b.centroid), blockPoints);
-        const blockGeoid = nearest.properties.geoid;
-        
-        employmentData[blockGeoid] = (employmentData[blockGeoid] || 0) + jobs;
-        });
-        
-        // Round job counts
-        Object.keys(employmentData).forEach(k => {
-        employmentData[k] = Math.round(employmentData[k]);
-        });
-    } else {
-        // Fallback: Uniform distribution based on population
-        blocks.forEach(block => {
-        const estimatedJobs = Math.round(block.population * TUNING_PARAMS.jobRatio);
-        employmentData[block.geoid] = estimatedJobs;
-        });
-    }
-    return employmentData;
-  }
+  // Fill in the data
+  const employmentData = {};
+  blocks.forEach(b => {
+    employmentData[b.geoid] = realJobCounts[b.geoid] || 0;
+  });
+  
+  const totalJobs = Object.values(employmentData).reduce((a, b) => a + b, 0);
+  console.log(`  Total jobs from LODES: ${totalJobs.toLocaleString()}`);
+  
+  return employmentData;
 };
 
 /**
@@ -645,7 +476,7 @@ const fetchCensusData = async (place) => {
     const blocks = await getCensusBlocksInBbox(place);
     
     // Step 2: Estimate employment
-    const employmentData = await estimateEmploymentData(blocks, place);
+    const employmentData = await getEmploymentData(blocks);
     
     // Step 2.5: Filter out blocks with no population AND no jobs
     const activeBlocks = blocks.filter(b => {
