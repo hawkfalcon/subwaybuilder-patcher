@@ -8,3 +8,5 @@ patcher/packages/*
 mapdata_processor/
 config.js
 .DS_Store
+SubwayBuilderPatched.app
+premade_maps/*
